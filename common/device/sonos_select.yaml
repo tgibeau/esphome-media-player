@@ -1,0 +1,49 @@
+# =============================================================================
+# SONOS DIRECT - IP configuration entity
+# =============================================================================
+# Persists the Sonos speaker IP address across reboots and activates
+# Sonos Direct mode when an IP is configured.
+#
+# When the field is populated the device polls the Sonos speaker directly
+# via the local UPnP/SOAP API (port 1400) instead of relying on Home
+# Assistant state subscriptions.
+#
+# Clear the field to return to HA mode.
+# =============================================================================
+
+text:
+  - platform: template
+    name: "Sonos IP"
+    id: sonos_ip_entity
+    entity_category: config
+    internal: ${ha_config_internal}
+    icon: "mdi:speaker"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    min_length: 0
+    max_length: 64
+    on_value:
+      - lambda: |-
+          // Trim trailing whitespace / newlines from the restored value.
+          std::string ip = x;
+          while (!ip.empty() &&
+                 (ip.back() == ' ' || ip.back() == '\n' || ip.back() == '\r')) {
+            ip.pop_back();
+          }
+
+          if (!ip.empty()) {
+            id(sonos_player_component)->set_ip_dynamic(ip);
+            id(sonos_player_component)->set_active(true);
+            id(sonos_direct_mode) = true;
+            // Hide the HA setup prompt — we do not need a Home Assistant entity.
+            if (lv_obj_is_valid(id(setup_prompt))) {
+              lv_obj_add_flag(id(setup_prompt), LV_OBJ_FLAG_HIDDEN);
+            }
+            ESP_LOGI("sonos_select", "Sonos Direct mode active, IP: %s", ip.c_str());
+          } else {
+            id(sonos_player_component)->set_active(false);
+            id(sonos_direct_mode) = false;
+            ESP_LOGI("sonos_select", "Sonos Direct mode disabled, reverting to HA mode");
+          }

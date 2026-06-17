@@ -179,18 +179,24 @@ lvgl:
                   text_color: 0xFFFFFF
                   hidden: true
             on_press:
-              - homeassistant.service:
-                  service: media_player.media_play_pause
-                  variables:
-                    target: !lambda |-
-                      return id(is_tv_mode) ? id(linked_media_player_entity).state : id(media_player_entity).state;
-                  data_template:
-                    entity_id: "{{ target }}"
-                  on_error:
-                    - lambda: |-
-                        if (!id(actions_prompt_acked) && !id(device_has_been_setup)) {
-                          lv_obj_clear_flag(id(actions_prompt), LV_OBJ_FLAG_HIDDEN);
-                        }
+              - if:
+                  condition:
+                    lambda: 'return id(sonos_direct_mode);'
+                  then:
+                    - lambda: 'id(sonos_player_component)->play_pause();'
+                  else:
+                    - homeassistant.service:
+                        service: media_player.media_play_pause
+                        variables:
+                          target: !lambda |-
+                            return id(is_tv_mode) ? id(linked_media_player_entity).state : id(media_player_entity).state;
+                        data_template:
+                          entity_id: "{{ target }}"
+                        on_error:
+                          - lambda: |-
+                              if (!id(actions_prompt_acked) && !id(device_has_been_setup)) {
+                                lv_obj_clear_flag(id(actions_prompt), LV_OBJ_FLAG_HIDDEN);
+                              }
               - logger.log: "Media: play_pause"
 
         # Progress bar: full screen width, at the very bottom of the screen
@@ -273,14 +279,20 @@ lvgl:
                           - lambda: |-
                               id(volume_pending_pct) = (int)(x + 0.5f);
                               id(volume_pending_until) = millis() + 1500;
-                          - homeassistant.service:
-                              service: media_player.volume_set
-                              variables:
-                                target: !lambda 'return id(media_player_entity).state;'
-                                vol_level: !lambda 'return x / 100.0f;'
-                              data_template:
-                                entity_id: "{{ target }}"
-                                volume_level: "{{ vol_level }}"
+                          - if:
+                              condition:
+                                lambda: 'return id(sonos_direct_mode);'
+                              then:
+                                - lambda: 'id(sonos_player_component)->set_volume(x / 100.0f);'
+                              else:
+                                - homeassistant.service:
+                                    service: media_player.volume_set
+                                    variables:
+                                      target: !lambda 'return id(media_player_entity).state;'
+                                      vol_level: !lambda 'return x / 100.0f;'
+                                    data_template:
+                                      entity_id: "{{ target }}"
+                                      volume_level: "{{ vol_level }}"
               - label:
                   id: volume_title_label
                   text: "Volume"

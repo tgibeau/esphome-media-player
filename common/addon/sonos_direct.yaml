@@ -1,0 +1,30 @@
+# =============================================================================
+# SONOS DIRECT - Poll a Sonos speaker on the local network (no Home Assistant)
+# =============================================================================
+# Wires the sonos_player C++ component to the shared sensor IDs used by
+# sensors.yaml so the display layer requires no changes.
+#
+# When sonos_direct_mode is false (default) this component is dormant and
+# all HA-mode behaviour is unaffected.  Set a Sonos IP via the "Sonos IP"
+# text entity (defined in sonos_select.yaml) to activate Sonos Direct mode.
+# =============================================================================
+
+globals:
+  - id: sonos_direct_mode
+    type: bool
+    initial_value: 'false'
+    restore_value: true
+
+sonos_player:
+  id: sonos_player_component
+  ip: ""
+  update_interval: ${playback_refresh_interval}
+  title_sensor: media_title_sensor
+  artist_sensor: media_artist_sensor
+  artwork_sensor: media_entity_picture_sensor
+  state_sensor: media_player_state_sensor
+  duration_sensor: media_duration_sensor
+  position_sensor: media_position_sensor
+  volume_sensor: media_volume_sensor
+  source_sensor: media_source_sensor
+  group_members_sensor: group_members_sensor

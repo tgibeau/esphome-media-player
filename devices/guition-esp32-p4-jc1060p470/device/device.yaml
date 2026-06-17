@@ -602,34 +602,46 @@ script:
   - id: swipe_next_track
     mode: single
     then:
-      - homeassistant.service:
-          service: media_player.media_next_track
-          variables:
-            target: !lambda |-
-              return id(is_tv_mode) ? id(linked_media_player_entity).state : id(media_player_entity).state;
-          data_template:
-            entity_id: "{{ target }}"
-          on_error:
-            - lambda: |-
-                if (!id(actions_prompt_acked) && !id(device_has_been_setup)) {
-                  lv_obj_clear_flag(id(actions_prompt), LV_OBJ_FLAG_HIDDEN);
-                }
+      - if:
+          condition:
+            lambda: 'return id(sonos_direct_mode);'
+          then:
+            - lambda: 'id(sonos_player_component)->next_track();'
+          else:
+            - homeassistant.service:
+                service: media_player.media_next_track
+                variables:
+                  target: !lambda |-
+                    return id(is_tv_mode) ? id(linked_media_player_entity).state : id(media_player_entity).state;
+                data_template:
+                  entity_id: "{{ target }}"
+                on_error:
+                  - lambda: |-
+                      if (!id(actions_prompt_acked) && !id(device_has_been_setup)) {
+                        lv_obj_clear_flag(id(actions_prompt), LV_OBJ_FLAG_HIDDEN);
+                      }
       - logger.log: "Media: next_track"
   - id: swipe_previous_track
     mode: single
     then:
-      - homeassistant.service:
-          service: media_player.media_previous_track
-          variables:
-            target: !lambda |-
-              return id(is_tv_mode) ? id(linked_media_player_entity).state : id(media_player_entity).state;
-          data_template:
-            entity_id: "{{ target }}"
-          on_error:
-            - lambda: |-
-                if (!id(actions_prompt_acked) && !id(device_has_been_setup)) {
-                  lv_obj_clear_flag(id(actions_prompt), LV_OBJ_FLAG_HIDDEN);
-                }
+      - if:
+          condition:
+            lambda: 'return id(sonos_direct_mode);'
+          then:
+            - lambda: 'id(sonos_player_component)->previous_track();'
+          else:
+            - homeassistant.service:
+                service: media_player.media_previous_track
+                variables:
+                  target: !lambda |-
+                    return id(is_tv_mode) ? id(linked_media_player_entity).state : id(media_player_entity).state;
+                data_template:
+                  entity_id: "{{ target }}"
+                on_error:
+                  - lambda: |-
+                      if (!id(actions_prompt_acked) && !id(device_has_been_setup)) {
+                        lv_obj_clear_flag(id(actions_prompt), LV_OBJ_FLAG_HIDDEN);
+                      }
       - logger.log: "Media: previous_track"
 
   # -- Settings panel (called by vertical swipe gestures) --

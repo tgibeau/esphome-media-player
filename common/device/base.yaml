@@ -50,3 +50,5 @@ packages:
   sensors: !include sensors.yaml
   media_player_select: !include media_player_select.yaml
   linked_sensors: !include linked_sensors.yaml
+  sonos_direct: !include ../addon/sonos_direct.yaml
+  sonos_select: !include sonos_select.yaml

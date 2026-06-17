@@ -111,6 +111,12 @@ script:
     mode: restart
     then:
       - lambda: |-
+          // Sonos Direct mode is active — skip HA subscriptions entirely.
+          if (id(sonos_direct_mode)) {
+            lv_obj_add_flag(id(setup_prompt), LV_OBJ_FLAG_HIDDEN);
+            return;
+          }
+
           // Wait for API to be ready (text restore fires before API init)
           if (esphome::api::global_api_server == nullptr) return;
 
@@ -226,6 +232,8 @@ script:
     mode: restart
     then:
       - lambda: |-
+          if (id(sonos_direct_mode)) return;
+
           if (esphome::api::global_api_server == nullptr) return;
 
           std::string entity = id(linked_media_player_entity).state;
