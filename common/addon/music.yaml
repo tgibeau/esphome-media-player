@@ -23,6 +23,11 @@ external_components:
   - source: github://jtenniswood/esphome-media-player@main
     components: [artwork_image, mipi_rgb]
     refresh: 1s
+  # sonos_player is a local component in the fork (not yet in upstream)
+  - source:
+      type: local
+      path: ../components
+    components: [sonos_player]
 
 http_request:
   id: http_req
