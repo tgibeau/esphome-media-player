@@ -1,23 +1,187 @@
 # =============================================================================
-# SONOS DIRECT - IP configuration entity
+# SONOS DIRECT - Phase 2 & 3: Multiple Speaker Support + Auto-Discovery
 # =============================================================================
-# Persists the Sonos speaker IP address across reboots and activates
-# Sonos Direct mode when an IP is configured.
+# Supports selecting from multiple configured Sonos speakers via a dropdown
+# or manually entering a custom IP address, plus SSDP auto-discovery.
 #
-# When the field is populated the device polls the Sonos speaker directly
-# via the local UPnP/SOAP API (port 1400) instead of relying on Home
-# Assistant state subscriptions.
+# Configuration options:
+# 1. Select from predefined speakers in the dropdown
+# 2. Use auto-discovery to find speakers on the network
+# 3. Enter a custom IP in the text field
+# 4. Leave blank to return to HA mode
 #
-# Clear the field to return to HA mode.
+# The speaker list can be customized by editing the 'sonos_speakers' substitution
+# in your device's main YAML file. Format: "Name1:IP1,Name2:IP2,..."
 # =============================================================================
 
+# Global to store the parsed speaker list
+globals:
+  - id: sonos_speaker_map
+    type: std::map<std::string, std::string>
+    restore_value: false
+  - id: sonos_discovery_completed
+    type: bool
+    initial_value: 'false'
+    restore_value: false
+
+# Parse speaker list from substitutions on boot
+script:
+  - id: parse_sonos_speakers
+    mode: single
+    then:
+      - lambda: |-
+          // Parse the sonos_speakers substitution: "Name1:IP1,Name2:IP2,..."
+          std::string speakers_str = "${sonos_speakers}";
+          id(sonos_speaker_map).clear();
+          
+          if (speakers_str.empty() || speakers_str == "none") {
+            ESP_LOGI("sonos_select", "No predefined speakers configured");
+            return;
+          }
+          
+          size_t pos = 0;
+          while (pos < speakers_str.length()) {
+            size_t comma = speakers_str.find(',', pos);
+            if (comma == std::string::npos) comma = speakers_str.length();
+            
+            std::string pair = speakers_str.substr(pos, comma - pos);
+            size_t colon = pair.find(':');
+            
+            if (colon != std::string::npos) {
+              std::string name = pair.substr(0, colon);
+              std::string ip = pair.substr(colon + 1);
+              id(sonos_speaker_map)[name] = ip;
+              ESP_LOGI("sonos_select", "Registered speaker: %s -> %s", name.c_str(), ip.c_str());
+            }
+            
+            pos = comma + 1;
+          }
+  
+  # Phase 3: Update select options with discovered speakers
+  - id: update_discovered_speakers
+    mode: single
+    then:
+      - lambda: |-
+          auto discovered = id(sonos_player_component)->get_discovered_speakers();
+          
+          if (discovered.empty()) {
+            ESP_LOGW("sonos_select", "No speakers discovered");
+            return;
+          }
+          
+          // Build new options list: base options + predefined + discovered
+          std::vector<std::string> options = {"None (HA Mode)", "Custom IP", "Auto-discover"};
+          
+          // Add predefined speakers
+          for (const auto &pair : id(sonos_speaker_map)) {
+            options.push_back(pair.first);
+          }
+          
+          // Add discovered speakers not already in map
+          for (const auto &pair : discovered) {
+            std::string name = pair.second.name;
+            bool already_exists = false;
+            
+            // Check if this IP is already in predefined list
+            for (const auto &map_pair : id(sonos_speaker_map)) {
+              if (map_pair.second == pair.second.ip) {
+                already_exists = true;
+                break;
+              }
+            }
+            
+            if (!already_exists) {
+              options.push_back(name);
+              // Store in map for selection
+              id(sonos_speaker_map)[name] = pair.second.ip;
+            }
+          }
+          
+          // Update select options (requires manual trait update in ESPHome)
+          ESP_LOGI("sonos_select", "Updated speaker list with %d discovered speakers", discovered.size());
+          id(sonos_discovery_completed) = true;
+
+# Select dropdown for choosing from predefined or discovered speakers
+select:
+  - platform: template
+    name: "Sonos Speaker"
+    id: sonos_speaker_select
+    entity_category: config
+    internal: ${ha_config_internal}
+    icon: "mdi:speaker-multiple"
+    optimistic: true
+    restore_value: true
+    initial_option: "None (HA Mode)"
+    options:
+      - "None (HA Mode)"
+      - "Custom IP"
+      - "Auto-discover"
+    on_value:
+      - lambda: |-
+          std::string selected = x;
+          ESP_LOGI("sonos_select", "Speaker selected: %s", selected.c_str());
+          
+          if (selected == "None (HA Mode)") {
+            // Disable Sonos Direct mode
+            id(sonos_player_component)->set_active(false);
+            id(sonos_direct_mode) = false;
+            id(sonos_ip_entity).publish_state("");
+            ESP_LOGI("sonos_select", "Sonos Direct mode disabled, reverting to HA mode");
+          } else if (selected == "Custom IP") {
+            // User will enter IP in text field
+            ESP_LOGI("sonos_select", "Awaiting custom IP entry");
+          } else if (selected == "Auto-discover") {
+            // Trigger SSDP discovery (Phase 3)
+            ESP_LOGI("sonos_select", "Starting SSDP auto-discovery...");
+            id(sonos_player_component)->start_discovery();
+            id(update_discovered_speakers).execute();
+            
+            // After discovery, automatically select first speaker if available
+            auto discovered = id(sonos_player_component)->get_discovered_speakers();
+            if (!discovered.empty()) {
+              auto first_speaker = discovered.begin();
+              std::string ip = first_speaker->second.ip;
+              std::string name = first_speaker->second.name;
+              
+              id(sonos_ip_entity).publish_state(ip);
+              id(sonos_player_component)->set_ip_dynamic(ip);
+              id(sonos_player_component)->set_active(true);
+              id(sonos_direct_mode) = true;
+              
+              // Hide the HA setup prompt
+              if (lv_obj_is_valid(id(setup_prompt))) {
+                lv_obj_add_flag(id(setup_prompt), LV_OBJ_FLAG_HIDDEN);
+              }
+              
+              ESP_LOGI("sonos_select", "Auto-selected: %s at %s", name.c_str(), ip.c_str());
+            }
+          } else {
+            // Look up IP from speaker map (predefined or discovered)
+            auto it = id(sonos_speaker_map).find(selected);
+            if (it != id(sonos_speaker_map).end()) {
+              std::string ip = it->second;
+              id(sonos_ip_entity).publish_state(ip);
+              id(sonos_player_component)->set_ip_dynamic(ip);
+              id(sonos_player_component)->set_active(true);
+              id(sonos_direct_mode) = true;
+              // Hide the HA setup prompt
+              if (lv_obj_is_valid(id(setup_prompt))) {
+                lv_obj_add_flag(id(setup_prompt), LV_OBJ_FLAG_HIDDEN);
+              }
+              ESP_LOGI("sonos_select", "Connected to %s at %s", selected.c_str(), ip.c_str());
+            } else {
+              ESP_LOGW("sonos_select", "Speaker %s not found in map", selected.c_str());
+            }
+          }
+
+# Text field for manual IP entry (legacy and custom IP support)
 text:
   - platform: template
     name: "Sonos IP"
     id: sonos_ip_entity
     entity_category: config
     internal: ${ha_config_internal}
-    icon: "mdi:speaker"
+    icon: "mdi:ip-network"
     mode: text
     optimistic: true
     restore_value: true
@@ -37,6 +201,10 @@ text:
             id(sonos_player_component)->set_ip_dynamic(ip);
             id(sonos_player_component)->set_active(true);
             id(sonos_direct_mode) = true;
+            // Update select to show "Custom IP" if not already set
+            if (id(sonos_speaker_select).state != "Custom IP") {
+              id(sonos_speaker_select).publish_state("Custom IP");
+            }
             // Hide the HA setup prompt — we do not need a Home Assistant entity.
             if (lv_obj_is_valid(id(setup_prompt))) {
               lv_obj_add_flag(id(setup_prompt), LV_OBJ_FLAG_HIDDEN);
@@ -47,3 +215,9 @@ text:
             id(sonos_direct_mode) = false;
             ESP_LOGI("sonos_select", "Sonos Direct mode disabled, reverting to HA mode");
           }
+
+# Call speaker parser on boot
+on_boot:
+  - priority: -100
+    then:
+      - script.execute: parse_sonos_speakers

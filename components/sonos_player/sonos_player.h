@@ -6,11 +6,23 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 
 #include <string>
+#include <map>
+#include <vector>
 
 namespace esphome {
 namespace sonos_player {
 
 static const char *const TAG = "sonos_player";
+
+// Structure to hold discovered speaker info
+struct SonosSpeaker {
+  std::string name;
+  std::string ip;
+  std::string uuid;
+  std::string room;
+  bool is_coordinator;
+  std::vector<std::string> group_members;
+};
 
 class SonosPlayer : public PollingComponent {
  public:
@@ -36,6 +48,15 @@ class SonosPlayer : public PollingComponent {
   // Enable or disable this component's polling without changing the IP.
   void set_active(bool active) { active_ = active; }
   bool is_active() const { return active_; }
+
+  // ----- Phase 3: SSDP Discovery and Grouping -----
+  // Start SSDP discovery for Sonos speakers on the network
+  void start_discovery();
+  
+  // Get list of discovered speakers
+  const std::map<std::string, SonosSpeaker> &get_discovered_speakers() const { 
+    return discovered_speakers_; 
+  }
 
   // ----- Playback commands (called from YAML lambdas) -----
   void play_pause();
@@ -70,6 +91,16 @@ class SonosPlayer : public PollingComponent {
   // Poll RenderingControl volume and update sensor.
   void poll_volume();
 
+  // ----- Phase 3: Discovery and Grouping helpers -----
+  // Perform SSDP M-SEARCH for Sonos devices
+  void perform_ssdp_discovery();
+  
+  // Query ZoneGroupTopology to get speaker grouping information
+  void query_zone_group_topology();
+  
+  // Parse zone group state XML response
+  void parse_zone_groups(const std::string &xml);
+
   // ----- XML / DIDL helpers -----
   // Extract the text content of the first matching tag.
   // Handles both <tag>value</tag> and <prefix:tag>value</prefix:tag>.
@@ -96,6 +127,10 @@ class SonosPlayer : public PollingComponent {
   // Consecutive failure counter – used to reduce log spam on unreachable hosts.
   int consecutive_failures_{0};
   static constexpr int kMaxLoggedFailures = 3;
+
+  // Phase 3: Discovery state
+  bool discovery_in_progress_{false};
+  std::map<std::string, SonosSpeaker> discovered_speakers_;
 
   // Sensor pointers (all optional – nullptr if not wired up in YAML)
   text_sensor::TextSensor *title_sensor_{nullptr};

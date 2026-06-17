@@ -3,6 +3,8 @@
 #include "esphome/core/log.h"
 
 #include <esp_http_client.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
 #include <cstdio>
 #include <cstring>
 
@@ -410,6 +412,238 @@ std::string SonosPlayer::resolve_artwork_url(const std::string &path) const {
   }
   // Relative path — prefix with Sonos speaker base URL.
   return "http://" + ip_ + ":1400" + path;
+}
+
+// =============================================================================
+// Phase 3: SSDP Discovery and Zone Group Topology
+// =============================================================================
+
+void SonosPlayer::start_discovery() {
+  if (discovery_in_progress_) {
+    ESP_LOGW(TAG, "Discovery already in progress");
+    return;
+  }
+  
+  ESP_LOGI(TAG, "Starting SSDP discovery for Sonos speakers...");
+  discovery_in_progress_ = true;
+  discovered_speakers_.clear();
+  
+  // Perform SSDP discovery (non-blocking, one-shot scan)
+  perform_ssdp_discovery();
+  
+  discovery_in_progress_ = false;
+  
+  if (!discovered_speakers_.empty()) {
+    ESP_LOGI(TAG, "Discovery complete: found %d speaker(s)", discovered_speakers_.size());
+    
+    // Query zone group topology for grouping info
+    if (!ip_.empty()) {
+      query_zone_group_topology();
+    }
+  } else {
+    ESP_LOGW(TAG, "No Sonos speakers discovered on the network");
+  }
+}
+
+void SonosPlayer::perform_ssdp_discovery() {
+  // Create UDP socket for SSDP M-SEARCH
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) {
+    ESP_LOGE(TAG, "Failed to create SSDP socket");
+    return;
+  }
+  
+  // Set socket timeout
+  struct timeval tv;
+  tv.tv_sec = 3;  // 3 second timeout
+  tv.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  
+  // Prepare SSDP M-SEARCH message
+  const char *ssdp_msg =
+      "M-SEARCH * HTTP/1.1\r\n"
+      "HOST: 239.255.255.250:1900\r\n"
+      "MAN: \"ssdp:discover\"\r\n"
+      "MX: 2\r\n"
+      "ST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n"
+      "\r\n";
+  
+  // Send to SSDP multicast address
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(1900);
+  inet_pton(AF_INET, "239.255.255.250", &addr.sin_addr);
+  
+  if (sendto(sock, ssdp_msg, strlen(ssdp_msg), 0, 
+             (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    ESP_LOGE(TAG, "Failed to send SSDP M-SEARCH");
+    close(sock);
+    return;
+  }
+  
+  ESP_LOGD(TAG, "Sent SSDP M-SEARCH, waiting for responses...");
+  
+  // Receive responses
+  char buffer[2048];
+  struct sockaddr_in from;
+  socklen_t fromlen = sizeof(from);
+  
+  while (true) {
+    int len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                      (struct sockaddr *)&from, &fromlen);
+    if (len <= 0) break;  // Timeout or error
+    
+    buffer[len] = '\0';
+    std::string response(buffer);
+    
+    // Extract IP address from response
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &from.sin_addr, ip_str, INET_ADDRSTRLEN);
+    std::string speaker_ip(ip_str);
+    
+    // Parse LOCATION header to get device description URL
+    size_t loc_pos = response.find("LOCATION:");
+    if (loc_pos == std::string::npos) {
+      loc_pos = response.find("Location:");
+    }
+    
+    if (loc_pos != std::string::npos) {
+      size_t url_start = response.find("http://", loc_pos);
+      if (url_start != std::string::npos) {
+        size_t url_end = response.find("\r\n", url_start);
+        if (url_end != std::string::npos) {
+          std::string location_url = response.substr(url_start, url_end - url_start);
+          
+          // Extract device info from the IP
+          SonosSpeaker speaker;
+          speaker.ip = speaker_ip;
+          speaker.name = "Sonos (" + speaker_ip + ")";  // Will be updated from device description
+          speaker.uuid = speaker_ip;  // Placeholder
+          speaker.is_coordinator = false;
+          
+          discovered_speakers_[speaker_ip] = speaker;
+          ESP_LOGI(TAG, "Discovered Sonos speaker at %s", speaker_ip.c_str());
+        }
+      }
+    }
+  }
+  
+  close(sock);
+  ESP_LOGD(TAG, "SSDP discovery scan complete");
+}
+
+void SonosPlayer::query_zone_group_topology() {
+  if (ip_.empty()) return;
+  
+  std::string response = soap_call(
+      "/ZoneGroupTopology/Control",
+      "urn:schemas-upnp-org:service:ZoneGroupTopology:1",
+      "GetZoneGroupState",
+      "<u:GetZoneGroupState xmlns:u=\"urn:schemas-upnp-org:service:ZoneGroupTopology:1\"/>");
+  
+  if (response.empty()) {
+    ESP_LOGW(TAG, "Failed to query zone group topology");
+    return;
+  }
+  
+  // Extract ZoneGroupState XML
+  std::string zone_state = extract_xml_value(response, "ZoneGroupState");
+  if (!zone_state.empty()) {
+    zone_state = decode_xml_entities(zone_state);
+    parse_zone_groups(zone_state);
+  }
+}
+
+void SonosPlayer::parse_zone_groups(const std::string &xml) {
+  ESP_LOGD(TAG, "Parsing zone groups...");
+  
+  // Parse ZoneGroups and ZoneGroupMember elements
+  // Format: <ZoneGroups><ZoneGroup Coordinator="..." ID="...">
+  //           <ZoneGroupMember UUID="..." Location="http://IP:1400/..." 
+  //                           ZoneName="Room" ... />
+  //         </ZoneGroup></ZoneGroups>
+  
+  size_t pos = 0;
+  while ((pos = xml.find("<ZoneGroupMember", pos)) != std::string::npos) {
+    size_t end = xml.find("/>", pos);
+    if (end == std::string::npos) break;
+    
+    std::string member = xml.substr(pos, end - pos + 2);
+    
+    // Extract UUID
+    size_t uuid_start = member.find("UUID=\"");
+    std::string uuid;
+    if (uuid_start != std::string::npos) {
+      uuid_start += 6;
+      size_t uuid_end = member.find("\"", uuid_start);
+      if (uuid_end != std::string::npos) {
+        uuid = member.substr(uuid_start, uuid_end - uuid_start);
+      }
+    }
+    
+    // Extract Location (IP)
+    size_t loc_start = member.find("Location=\"http://");
+    std::string member_ip;
+    if (loc_start != std::string::npos) {
+      loc_start += 17;  // Skip "Location=\"http://"
+      size_t loc_end = member.find(":", loc_start);
+      if (loc_end != std::string::npos) {
+        member_ip = member.substr(loc_start, loc_end - loc_start);
+      }
+    }
+    
+    // Extract ZoneName (room name)
+    size_t name_start = member.find("ZoneName=\"");
+    std::string room_name;
+    if (name_start != std::string::npos) {
+      name_start += 10;
+      size_t name_end = member.find("\"", name_start);
+      if (name_end != std::string::npos) {
+        room_name = member.substr(name_start, name_end - name_start);
+      }
+    }
+    
+    // Update or add speaker info
+    if (!member_ip.empty()) {
+      auto it = discovered_speakers_.find(member_ip);
+      if (it != discovered_speakers_.end()) {
+        it->second.uuid = uuid;
+        it->second.room = room_name;
+        it->second.name = room_name.empty() ? "Sonos (" + member_ip + ")" : room_name;
+      } else {
+        // Add new speaker discovered via topology
+        SonosSpeaker speaker;
+        speaker.ip = member_ip;
+        speaker.uuid = uuid;
+        speaker.room = room_name;
+        speaker.name = room_name.empty() ? "Sonos (" + member_ip + ")" : room_name;
+        speaker.is_coordinator = false;
+        discovered_speakers_[member_ip] = speaker;
+      }
+      
+      ESP_LOGI(TAG, "Speaker: %s (%s) - UUID: %s", 
+               room_name.c_str(), member_ip.c_str(), uuid.c_str());
+    }
+    
+    pos = end + 2;
+  }
+  
+  // Update group members sensor if active speaker is part of a group
+  if (group_members_sensor_ != nullptr && !ip_.empty()) {
+    // Find the current speaker's group
+    std::string group_info;
+    for (const auto &pair : discovered_speakers_) {
+      if (pair.first == ip_) {
+        group_info = pair.second.name;
+        break;
+      }
+    }
+    
+    if (!group_info.empty()) {
+      group_members_sensor_->publish_state(group_info);
+    }
+  }
 }
 
 }  // namespace sonos_player

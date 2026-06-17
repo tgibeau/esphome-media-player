@@ -21,6 +21,11 @@ substitutions:
   backlight_min_visible_level: "0.02f"
   screen_schedule_internal: "true"
   ha_config_internal: "false"
+  # Sonos Direct Mode - Phase 2: Multiple Speaker Support
+  # Format: "Name1:IP1,Name2:IP2,Name3:IP3"
+  # Example: "Living Room:192.168.1.10,Kitchen:192.168.1.11,Bedroom:192.168.1.12"
+  # Set to "none" to disable predefined speakers (custom IP only)
+  sonos_speakers: "none"
 
 preferences:
   # The dashboard UI keeps display buffers in external RAM while ESPHome also
