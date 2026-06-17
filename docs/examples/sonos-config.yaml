@@ -1,0 +1,83 @@
+# =============================================================================
+# Example: Sonos Direct Mode Configuration
+# =============================================================================
+# This file demonstrates how to configure Sonos Direct Mode with multiple
+# speakers for your ESPHome Media Player device.
+#
+# Copy relevant sections to your device's esphome.yaml file.
+# =============================================================================
+
+substitutions:
+  # Basic device info
+  name: "music-dashboard-sonos"
+  friendly_name: "Music Dashboard Sonos"
+  
+  # =============================================================================
+  # PHASE 2: Multiple Speaker Configuration
+  # =============================================================================
+  # Format: "Name1:IP1,Name2:IP2,Name3:IP3"
+  # Replace with your actual Sonos speaker names and IP addresses
+  #
+  # How to find your Sonos IP addresses:
+  # 1. Open the Sonos app
+  # 2. Go to Settings → System → About My System
+  # 3. Note the IP address for each speaker
+  #
+  # OR use your router's DHCP client list
+  # =============================================================================
+  
+  # Example with multiple rooms:
+  sonos_speakers: "Living Room:192.168.1.10,Kitchen:192.168.1.11,Bedroom:192.168.1.12,Office:192.168.1.13"
+  
+  # Example with descriptive names:
+  # sonos_speakers: "Main Speaker:192.168.1.10,Patio:192.168.1.20,Garage:192.168.1.30"
+  
+  # For single speaker only (Phase 1 compatibility):
+  # sonos_speakers: "none"
+  
+  # For discovery-only (no predefined speakers):
+  # sonos_speakers: "none"
+
+# =============================================================================
+# Usage Instructions
+# =============================================================================
+# 
+# After flashing this configuration:
+#
+# 1. Connect to the device's web interface at http://music-dashboard-sonos.local
+#    (or use the IP address shown in ESPHome logs)
+#
+# 2. Navigate to the configuration section
+#
+# 3. You'll see two controls:
+#    - "Sonos Speaker" (dropdown)
+#    - "Sonos IP" (text field)
+#
+# 4. Choose your connection method:
+#
+#    METHOD A: Select a predefined speaker
+#    ----------------------------------------
+#    - Open the "Sonos Speaker" dropdown
+#    - Choose one of your configured speakers (e.g., "Living Room")
+#    - The device will automatically connect
+#
+#    METHOD B: Auto-discover speakers
+#    ----------------------------------------
+#    - Open the "Sonos Speaker" dropdown
+#    - Select "Auto-discover"
+#    - Wait a few seconds for the scan to complete
+#    - The first discovered speaker will be auto-selected
+#    - Discovered speakers are added to the dropdown
+#
+#    METHOD C: Enter a custom IP
+#    ----------------------------------------
+#    - Open the "Sonos Speaker" dropdown
+#    - Select "Custom IP"
+#    - Type the speaker's IP address in the "Sonos IP" field
+#    - Press Enter or tap away to connect
+#
+#    METHOD D: Return to Home Assistant mode
+#    ----------------------------------------
+#    - Open the "Sonos Speaker" dropdown
+#    - Select "None (HA Mode)"
+#    - The device will use the Home Assistant media player entity
