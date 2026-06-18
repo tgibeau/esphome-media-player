@@ -21,7 +21,7 @@ static const char *const CONTENT_TYPE_HEADER_NAME = "content-type";
 static constexpr uint32_t RETIRED_BUFFER_GRACE_MS = 1000;
 static constexpr size_t MAX_RETIRED_BUFFERS = 2;
 static constexpr size_t MAX_DOWNLOAD_BUFFER_SIZE = 2 * 1024 * 1024;
-static constexpr int LOCAL_ARTWORK_HTTP_TIMEOUT_MS = 6500;
+static constexpr int LOCAL_ARTWORK_HTTP_TIMEOUT_MS = 2500;
 
 #include "image_decoder.h"
 

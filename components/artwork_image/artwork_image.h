@@ -248,7 +248,7 @@ class ArtworkImage : public PollingComponent,
   uint32_t last_data_millis_{0};
   bool update_pending_{false};
   std::string pending_url_{""};
-  static constexpr uint32_t DOWNLOAD_STALL_TIMEOUT_MS = 10000;
+  static constexpr uint32_t DOWNLOAD_STALL_TIMEOUT_MS = 3000;
 
   friend bool ImageDecoder::set_size(int width, int height);
   friend void ImageDecoder::draw(int x, int y, int w, int h, const Color &color);

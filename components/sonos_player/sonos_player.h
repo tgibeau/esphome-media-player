@@ -8,6 +8,8 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <atomic>
+#include <mutex>
 
 namespace esphome {
 namespace sonos_player {
@@ -27,7 +29,10 @@ struct SonosSpeaker {
 class SonosPlayer : public PollingComponent {
  public:
   // ----- Configuration setters (called from generated code) -----
-  void set_ip(const std::string &ip) { ip_ = ip; }
+  void set_ip(const std::string &ip) {
+    std::lock_guard<std::mutex> lk(ip_mutex_);
+    ip_ = ip;
+  }
 
   void set_title_sensor(text_sensor::TextSensor *s) { title_sensor_ = s; }
   void set_artist_sensor(text_sensor::TextSensor *s) { artist_sensor_ = s; }
@@ -50,9 +55,17 @@ class SonosPlayer : public PollingComponent {
   bool is_active() const { return active_; }
 
   // ----- Phase 3: SSDP Discovery and Grouping -----
-  // Start SSDP discovery for Sonos speakers on the network
+  // Start SSDP discovery for Sonos speakers on the network (BLOCKING ~3 s –
+  // only call off the main loop).
   void start_discovery();
-  
+
+  // Non-blocking: ask the background SOAP task to run a discovery scan. Returns
+  // immediately; poll is_discovery_active() to know when results are ready.
+  void request_discovery();
+
+  // True while a background discovery scan is running.
+  bool is_discovery_active() const { return discovery_active_.load(); }
+
   // Get list of discovered speakers
   const std::map<std::string, SonosSpeaker> &get_discovered_speakers() const { 
     return discovered_speakers_; 
@@ -85,11 +98,26 @@ class SonosPlayer : public PollingComponent {
                     const std::string &action,
                     const std::string &inner_body);
 
-  // Poll AVTransport (transport state + position info) and update sensors.
-  void poll_av_transport();
+  // Result struct populated by the SOAP task and handed back to the main loop
+  // via Component::defer() so all sensor writes remain on the main thread.
+  struct PollResult {
+    bool connected{false};
+    bool have_metadata{false}; // true only when GetPositionInfo returned metadata
+    std::string state;       // "playing" / "paused" / "idle"
+    std::string title;
+    std::string artist;
+    std::string artwork_url; // empty = no artwork / unchanged
+    float duration{-1.0f};   // negative = not available
+    float position{-1.0f};
+    float volume{-1.0f};     // negative = not polled this cycle
+  };
 
-  // Poll RenderingControl volume and update sensor.
-  void poll_volume();
+  // Long-running FreeRTOS task: owns the persistent HTTP client and performs
+  // all blocking SOAP I/O so the main loop / LVGL never stalls.
+  static void soap_task_entry_(void *arg);
+
+  // Apply a PollResult on the main loop (called from defer()).
+  void apply_poll_result_(const PollResult &r);
 
   // ----- Phase 3: Discovery and Grouping helpers -----
   // Perform SSDP M-SEARCH for Sonos devices
@@ -115,22 +143,62 @@ class SonosPlayer : public PollingComponent {
   // Build the full artwork URL: if path starts with '/' prefix with http://IP:1400.
   std::string resolve_artwork_url(const std::string &path) const;
 
-  // ----- Members -----
-  std::string ip_;
-  bool active_{false};
+  // Thread-safe snapshot of ip_.  The SOAP task and main loop both read ip_
+  // while the main loop may rewrite it via set_ip_dynamic(), so all reads go
+  // through this locked accessor (returns a copy that is safe to use).
+  std::string get_ip_() const {
+    std::lock_guard<std::mutex> lk(ip_mutex_);
+    return ip_;
+  }
 
-  // How often to refresh volume relative to the main poll cycle.
-  // Volume is polled every volume_poll_divisor_ update() calls.
-  int poll_counter_{0};
+  // ----- Members -----
+  mutable std::mutex ip_mutex_;  // guards ip_ across the main loop / SOAP task
+  std::string ip_;
+  std::atomic<bool> active_{false};
+
+  // SOAP is only fired every kSoapPollDivisor update() calls (1 s default).
+  // Position is incremented locally each second in between.
+  static constexpr int kSoapPollDivisor = 1;
+  int soap_skip_counter_{0};
+
+  // Volume is polled every kVolumePollDivisor SOAP cycles (every ~25 s).
   static constexpr int kVolumePollDivisor = 5;
 
-  // Consecutive failure counter – used to reduce log spam on unreachable hosts.
+  // Consecutive failure counter – written by apply_poll_result_() (main loop),
+  // read by update() (main loop).  No cross-thread access.
   int consecutive_failures_{0};
   static constexpr int kMaxLoggedFailures = 3;
+
+  // Backoff: update() skips sending task notifications when the speaker has
+  // been repeatedly unreachable, preventing socket-table exhaustion.
+  int backoff_skip_counter_{0};
+
+  // FreeRTOS task handle for the long-running SOAP poll task.
+  // Stored as void* to avoid pulling <freertos/task.h> into the header.
+  void *soap_task_handle_{nullptr};
+
+  // Local playback state – updated by apply_poll_result_() and used by
+  // update() to advance position without a SOAP call every second.
+  std::string local_state_;     // "playing" / "paused" / "idle"
+  float local_position_{0.0f}; // seconds elapsed in current track
+  float local_duration_{0.0f}; // total track length in seconds (0 = unknown)
+
+  // Last-published values for sensors that rarely change.
+  // apply_poll_result_() compares against these before calling publish_state()
+  // so the API / HA is not flooded with duplicate values at 1-second intervals.
+  std::string last_published_state_;
+  std::string last_published_title_;
+  std::string last_published_artist_;
+  std::string last_published_artwork_;
+  float last_published_duration_{-1.0f};
+  float last_published_volume_{-1.0f};
 
   // Phase 3: Discovery state
   bool discovery_in_progress_{false};
   std::map<std::string, SonosSpeaker> discovered_speakers_;
+  // Async discovery flags (set on main loop, consumed by the SOAP task).
+  std::atomic<bool> discovery_requested_{false};  // a scan has been requested
+  std::atomic<bool> discovery_active_{false};     // a scan is currently running
 
   // Sensor pointers (all optional – nullptr if not wired up in YAML)
   text_sensor::TextSensor *title_sensor_{nullptr};

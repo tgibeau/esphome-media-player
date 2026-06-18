@@ -26,7 +26,7 @@ external_components:
   # sonos_player is a local component in the fork (not yet in upstream)
   - source:
       type: local
-      path: ../components
+      path: ../../components
     components: [sonos_player]
 
 http_request:

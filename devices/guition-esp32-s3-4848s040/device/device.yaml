@@ -27,6 +27,21 @@ esp32:
   watchdog_timeout: 15s
   framework:
     type: esp-idf
+    sdkconfig_options:
+      # Integrate PSRAM into the general heap so malloc()/operator new can
+      # spill into the 8 MB PSRAM instead of aborting when the small (~300 KB)
+      # internal DRAM heap is exhausted. Without this, only explicit
+      # heap_caps_malloc(MALLOC_CAP_SPIRAM) reaches PSRAM, and a tiny alloc
+      # such as a backlight LightTransitionTransformer (or std::string / LVGL
+      # buffer) during artwork decode + WiFi traffic fails and reboots the
+      # device (C++ exceptions are disabled, so a failed new -> abort()).
+      CONFIG_SPIRAM_USE_MALLOC: "y"
+      # Allocations smaller than this stay in internal RAM (keeps hot/DMA-ish
+      # small objects fast); larger ones may spill to PSRAM.
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "4096"
+      # Move WiFi/LWIP buffers into PSRAM to relieve internal DRAM pressure
+      # (also helps the SOAP socket allocations under load).
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: "y"
 
 
 # -----------------------------------------------------------------------------
@@ -74,6 +89,10 @@ ota:
 # The encryption key is typically set in your secrets.yaml file.
 # -----------------------------------------------------------------------------
 api:
+  # Sonos Direct mode runs without Home Assistant, so no API client ever
+  # connects. The default reboot_timeout (15 min) would reboot the device on a
+  # loop ("[api] No clients; rebooting"). 0s disables that watchdog reboot.
+  reboot_timeout: 0s
   on_client_connected:
     - lambda: |-
         if (client_info.find("Home Assistant") != std::string::npos) {
@@ -235,6 +254,15 @@ globals:
     type: bool
     initial_value: 'false'
 
+  # -- Speaker picker (Sonos Direct) --
+  - id: picker_ips               # IPs parallel to the roller options, by row index
+    type: std::vector<std::string>
+    restore_value: false
+  - id: picker_scanning          # True while a discovery scan is in flight
+    type: bool
+    initial_value: 'false'
+    restore_value: false
+
   # -- TV source mode --
   - id: is_tv_mode
     type: bool
@@ -255,6 +283,24 @@ globals:
     restore_value: true
     initial_value: 'false'
 
+
+
+# -----------------------------------------------------------------------------
+# SPEAKER PICKER POLL
+# -----------------------------------------------------------------------------
+# While a discovery scan is running (kicked off when the picker opens), poll the
+# component's is_discovery_active() flag. When it clears, populate the roller
+# with the discovered room names.
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 300ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(picker_scanning) && !id(sonos_player_component)->is_discovery_active();'
+          then:
+            - lambda: 'id(picker_scanning) = false;'
+            - script.execute: populate_speaker_picker
 
 
 # -----------------------------------------------------------------------------
@@ -506,11 +552,7 @@ script:
     mode: single
     then:
       - lambda: 'id(is_panel_open) = true;'
-      - if:
-          condition:
-            lambda: 'return id(speaker_count) <= 1;'
-          then:
-            - script.execute: show_fallback_speaker
+      - script.execute: show_speaker_picker
       - lvgl.widget.show: settings_panel
       - script.execute: start_speaker_panel_timeout
   - id: close_settings_panel
@@ -519,6 +561,70 @@ script:
       - script.stop: start_speaker_panel_timeout
       - lvgl.widget.hide: settings_panel
       - lambda: 'id(is_panel_open) = false;'
+
+  # -- Speaker picker: discover Sonos zones and let the user tap one --
+  - id: show_speaker_picker
+    mode: single
+    then:
+      - lambda: |-
+          // Hide the volume / group-mixer widgets so the panel shows only the picker.
+          lv_obj_add_flag(id(volume_arc), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(volume_title_label), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(volume_pct_label), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(volume_down_button), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(volume_up_button), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(speakers_container), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(speakers_title_label), LV_OBJ_FLAG_HIDDEN);
+          // Show the picker widgets.
+          lv_obj_clear_flag(id(picker_title_label), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(picker_status_label), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(speaker_roller)->obj, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(picker_connect_button), LV_OBJ_FLAG_HIDDEN);
+          lv_label_set_text(id(picker_status_label), "Scanning...");
+          lv_roller_set_options(id(speaker_roller)->obj, "Scanning...", LV_ROLLER_MODE_NORMAL);
+          // Kick off a non-blocking discovery scan on the background task.
+          id(sonos_player_component)->request_discovery();
+          id(picker_scanning) = true;
+
+  - id: populate_speaker_picker
+    mode: single
+    then:
+      - lambda: |-
+          const auto &speakers = id(sonos_player_component)->get_discovered_speakers();
+          id(picker_ips).clear();
+          std::string opts;
+          for (const auto &entry : speakers) {
+            if (!opts.empty()) opts += "\n";
+            opts += entry.second.name;
+            id(picker_ips).push_back(entry.second.ip);
+          }
+          if (id(picker_ips).empty()) {
+            lv_roller_set_options(id(speaker_roller)->obj, "No speakers found", LV_ROLLER_MODE_NORMAL);
+            lv_label_set_text(id(picker_status_label), "None found - swipe up to close");
+            return;
+          }
+          lv_roller_set_options(id(speaker_roller)->obj, opts.c_str(), LV_ROLLER_MODE_NORMAL);
+          char buf[40];
+          snprintf(buf, sizeof(buf), "%d speakers - tap Connect", (int) id(picker_ips).size());
+          lv_label_set_text(id(picker_status_label), buf);
+
+  - id: picker_connect_selected
+    mode: single
+    then:
+      - lambda: |-
+          uint16_t sel = lv_roller_get_selected(id(speaker_roller)->obj);
+          if (sel >= id(picker_ips).size()) return;
+          std::string ip = id(picker_ips)[sel];
+          ESP_LOGI("picker", "Speaker row %u selected -> %s", sel, ip.c_str());
+          // Set via make_call() (not publish_state) so the value is written to the
+          // restore-value preference store. on_value still fires, so set_ip_dynamic
+          // + direct mode still run. global_preferences->sync() flushes it to flash
+          // immediately because this build uses flash_write_interval: never.
+          auto call = id(sonos_ip_entity).make_call();
+          call.set_value(ip);
+          call.perform();
+          global_preferences->sync();
+      - script.execute: close_settings_panel
   - id: start_speaker_panel_timeout
     mode: restart
     then:

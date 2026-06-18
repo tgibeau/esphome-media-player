@@ -217,7 +217,8 @@ text:
           }
 
 # Call speaker parser on boot
-on_boot:
-  - priority: -100
+esphome:
+  on_boot:
+    priority: -100
     then:
       - script.execute: parse_sonos_speakers

@@ -5,7 +5,10 @@
 #include <esp_http_client.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace esphome {
@@ -22,7 +25,12 @@ struct HttpResponse {
 static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
   auto *resp = static_cast<HttpResponse *>(evt->user_data);
   if (evt->event_id == HTTP_EVENT_ON_DATA && resp != nullptr) {
-    if (resp->body.size() + evt->data_len < 8192) {
+    // Cap response accumulation to bound memory. The largest expected response
+    // is GetZoneGroupState on a big Sonos system (~15-20 KB for ~20 zones), so
+    // allow up to 64 KB. With PSRAM-backed malloc this lives in PSRAM, not the
+    // scarce internal DRAM. Without a large enough cap the topology XML is
+    // truncated and room names fail to parse.
+    if (resp->body.size() + evt->data_len < 65536) {
       resp->body.append(static_cast<const char *>(evt->data), evt->data_len);
     }
   }
@@ -34,19 +42,59 @@ static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
 // =============================================================================
 
 void SonosPlayer::setup() {
-  ESP_LOGD(TAG, "SonosPlayer setup (ip='%s' active=%d)", ip_.c_str(), active_);
+  ESP_LOGD(TAG, "SonosPlayer setup (ip='%s' active=%d)", ip_.c_str(), active_.load());
+  // Spawn the long-running SOAP poll task.  It blocks on
+  // ulTaskNotifyTake() until update() wakes it, then performs all SOAP I/O
+  // without ever touching the main loop.
+  xTaskCreatePinnedToCore(
+      soap_task_entry_,
+      "sonos_soap",
+      8192,   // stack: includes url[128]+soap_action[128]+body[512] per call
+      this,
+      1,      // priority: same as ESPHome main loop
+      reinterpret_cast<TaskHandle_t *>(&soap_task_handle_),
+      1);     // pin to APP_CPU (core 1) — same as ESPHome main loop,
+              // keeps core 0 (PRO_CPU/WiFi) free for the WiFi driver
 }
 
 void SonosPlayer::update() {
-  if (!active_ || ip_.empty()) return;
+  if (!active_ || ip_.empty() || soap_task_handle_ == nullptr) return;
 
-  poll_av_transport();
-
-  poll_counter_++;
-  if (poll_counter_ >= kVolumePollDivisor) {
-    poll_counter_ = 0;
-    poll_volume();
+  // --- 1. Advance position locally (no SOAP required) ---
+  // While the track is playing, increment the cached position by 1 s and
+  // publish it so the UI stays smooth between SOAP polls.
+  // update() is the SOLE publisher of position_sensor_; apply_poll_result_()
+  // only syncs local_position_ to avoid double-publish / 0-flash artifacts.
+  if (local_state_ == "playing") {
+    local_position_ += 1.0f;
   }
+  // Publish position every tick once state is known (covers paused too).
+  if (position_sensor_ && !local_state_.empty()) {
+    position_sensor_->publish_state(local_position_);
+  }
+
+  // --- 2. Decide whether to wake the SOAP task ---
+
+  // Backoff: after kMaxLoggedFailures repeated failures, poll much less
+  // aggressively so TIME_WAIT sockets have time to expire (~60 s).
+  if (consecutive_failures_ > kMaxLoggedFailures) {
+    static constexpr int kBackoffCycles = 6;
+    if (++backoff_skip_counter_ < kBackoffCycles) return;
+    backoff_skip_counter_ = 0;
+    soap_skip_counter_ = 0; // send notification immediately after backoff
+  } else {
+    // Normal mode: poll every kSoapPollDivisor seconds, but trigger
+    // immediately when the track is about to end (within 2 s of duration)
+    // so we pick up the new track without a noticeable gap.
+    bool near_end = local_duration_ > 0.0f &&
+                    local_position_ >= local_duration_ - 2.0f;
+    if (!near_end) {
+      if (++soap_skip_counter_ < kSoapPollDivisor) return;
+    }
+    soap_skip_counter_ = 0;
+  }
+
+  xTaskNotifyGive(static_cast<TaskHandle_t>(soap_task_handle_));
 }
 
 // =============================================================================
@@ -54,11 +102,25 @@ void SonosPlayer::update() {
 // =============================================================================
 
 void SonosPlayer::set_ip_dynamic(const std::string &ip) {
-  if (ip == ip_) return;
-  ip_ = ip;
+  {
+    std::lock_guard<std::mutex> lk(ip_mutex_);
+    if (ip == ip_) return;
+    ip_ = ip;
+  }
   consecutive_failures_ = 0;
-  poll_counter_ = 0;
-  ESP_LOGI(TAG, "Sonos IP updated: '%s'", ip_.c_str());
+  backoff_skip_counter_ = 0;
+  soap_skip_counter_ = 0;
+  local_state_.clear();
+  local_position_ = 0.0f;
+  local_duration_ = 0.0f;
+  // Clear last-published cache so the new speaker's values publish immediately.
+  last_published_state_.clear();
+  last_published_title_.clear();
+  last_published_artist_.clear();
+  last_published_artwork_.clear();
+  last_published_duration_ = -1.0f;
+  last_published_volume_ = -1.0f;
+  ESP_LOGI(TAG, "Sonos IP updated: '%s'", ip.c_str());
 }
 
 // =============================================================================
@@ -145,115 +207,264 @@ void SonosPlayer::set_volume(float volume) {
 }
 
 // =============================================================================
-// Polling helpers
+// SOAP background task + result application
 // =============================================================================
 
-void SonosPlayer::poll_av_transport() {
-  // ---- Transport state (playing / paused / stopped) ----
-  std::string transport_resp = soap_call(
-      "/MediaRenderer/AVTransport/Control",
-      "urn:schemas-upnp-org:service:AVTransport:1",
-      "GetTransportInfo",
-      "<u:GetTransportInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">"
-      "<InstanceID>0</InstanceID>"
-      "</u:GetTransportInfo>");
+// static
+void SonosPlayer::soap_task_entry_(void *arg) {
+  auto *self = static_cast<SonosPlayer *>(arg);
 
-  if (transport_resp.empty()) {
+  // Persistent HTTP client – reused across poll cycles for the same IP.
+  // Avoids the per-call alloc/free overhead and socket CLOSE_WAIT churn.
+  esp_http_client_handle_t client = nullptr;
+  std::string client_ip;
+  int poll_ctr = 0;
+
+  // Build a SOAP envelope and perform one request using the persistent client.
+  // Uses stack buffers (no heap allocation) so a low-DRAM situation can never
+  // trigger std::bad_alloc -> abort() inside the task.
+  // Returns the response body, or "" on error (client is cleaned up on error).
+  auto soap = [&](const char *path,
+                  const char *service_ns,
+                  const char *action,
+                  const char *inner_body) -> std::string {
+    // Stack-allocated buffers: no heap involvement for request setup.
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:1400%s", client_ip.c_str(), path);
+
+    char soap_action[128];
+    snprintf(soap_action, sizeof(soap_action), "\"%s#%s\"", service_ns, action);
+
+    char body[512];
+    int body_len = snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\"?>"
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\""
+        " s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+        "<s:Body>%s</s:Body></s:Envelope>",
+        inner_body);
+
+    HttpResponse resp;
+    esp_http_client_set_url(client, url);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_user_data(client, &resp);
+    esp_http_client_set_header(client, "Content-Type", "text/xml; charset=\"utf-8\"");
+    esp_http_client_set_header(client, "SOAPAction", soap_action);
+    esp_http_client_set_post_field(client, body, body_len);
+
+    if (esp_http_client_perform(client) != ESP_OK) {
+      esp_http_client_cleanup(client);
+      client = nullptr;
+      return "";
+    }
+    return resp.body;
+  };
+
+  while (true) {
+    // Block until update() sends a notification.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // --- Async discovery request ---
+    // Runs regardless of active state / current IP: SSDP needs no speaker, and
+    // topology only needs one if an IP is already set. Guarded by
+    // discovery_active_ so the UI only reads results once this clears.
+    if (self->discovery_requested_.exchange(false)) {
+      self->perform_ssdp_discovery();
+      if (!self->get_ip_().empty()) {
+        self->query_zone_group_topology();
+      }
+      self->discovery_active_ = false;
+      continue;  // skip the poll cycle for this wake
+    }
+
+    const std::string ip = self->get_ip_();
+    if (!self->active_ || ip.empty()) continue;
+
+    // Recreate the persistent client when the target IP changes.
+    if (client != nullptr && ip != client_ip) {
+      esp_http_client_cleanup(client);
+      client = nullptr;
+    }
+
+    if (client == nullptr) {
+      // Initialise with any valid URL; soap() overrides it per call.
+      std::string init_url = "http://" + ip + ":1400/MediaRenderer/AVTransport/Control";
+      esp_http_client_config_t cfg{};
+      cfg.url            = init_url.c_str();
+      cfg.method         = HTTP_METHOD_POST;
+      cfg.timeout_ms     = 3000;
+      cfg.event_handler  = http_event_cb;
+      cfg.buffer_size    = 512;
+      cfg.buffer_size_tx = 512;
+      // Sonos always responds with Connection: close — keep-alive is not supported.
+      // Setting keep_alive_enable = false prevents the client from trying to reuse
+      // a socket that Sonos has already closed, which would cause a 3-second SYN timeout.
+      cfg.keep_alive_enable = false;
+      client = esp_http_client_init(&cfg);
+      if (client == nullptr) {
+        ESP_LOGE(TAG, "Failed to init SOAP client for %s", ip.c_str());
+        auto *result = new PollResult{};
+        self->defer([self, result]() {
+          self->apply_poll_result_(*result);
+          delete result;
+        });
+        continue;
+      }
+      client_ip = ip;
+    }
+
+    // --- GetTransportInfo ---
+    std::string t_resp = soap(
+        "/MediaRenderer/AVTransport/Control",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "GetTransportInfo",
+        "<u:GetTransportInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">"
+        "<InstanceID>0</InstanceID></u:GetTransportInfo>");
+
+    if (t_resp.empty()) {
+      // client was already cleaned up inside soap(); post a failure result.
+      auto *result = new PollResult{};
+      self->defer([self, result]() {
+        self->apply_poll_result_(*result);
+        delete result;
+      });
+      continue;
+    }
+
+    // Build the result that will be applied on the main loop.
+    auto *result = new PollResult{};
+    result->connected = true;
+
+    const std::string raw_state =
+        self->extract_xml_value(t_resp, "CurrentTransportState");
+    if (raw_state == "PLAYING")          result->state = "playing";
+    else if (raw_state == "PAUSED_PLAYBACK") result->state = "paused";
+    else                                     result->state = "idle";
+
+    // --- GetPositionInfo (non-fatal if it fails) ---
+    if (client != nullptr) {
+      std::string p_resp = soap(
+          "/MediaRenderer/AVTransport/Control",
+          "urn:schemas-upnp-org:service:AVTransport:1",
+          "GetPositionInfo",
+          "<u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">"
+          "<InstanceID>0</InstanceID></u:GetPositionInfo>");
+
+      if (!p_resp.empty()) {
+        result->duration = self->parse_duration(
+            self->extract_xml_value(p_resp, "TrackDuration"));
+        result->position = self->parse_duration(
+            self->extract_xml_value(p_resp, "RelTime"));
+
+        std::string meta_enc = self->extract_xml_value(p_resp, "TrackMetaData");
+        if (!meta_enc.empty() && meta_enc != "NOT_IMPLEMENTED") {
+          std::string meta = self->decode_xml_entities(meta_enc);
+          result->title  = self->decode_xml_entities(self->extract_xml_value(meta, "title"));
+          result->artist = self->decode_xml_entities(self->extract_xml_value(meta, "creator"));
+          std::string art = self->extract_xml_value(meta, "albumArtURI");
+          if (!art.empty()) art = self->decode_xml_entities(art);
+          result->artwork_url = self->resolve_artwork_url(art);
+          // Mark that this poll carried authoritative track metadata so the
+          // main loop knows it may overwrite title/artist/artwork (including
+          // clearing them when a field is genuinely empty).
+          result->have_metadata = true;
+        }
+      }
+    }
+
+    // --- GetVolume (every kVolumePollDivisor cycles) ---
+    if (client != nullptr && ++poll_ctr >= kVolumePollDivisor) {
+      poll_ctr = 0;
+      std::string v_resp = soap(
+          "/MediaRenderer/RenderingControl/Control",
+          "urn:schemas-upnp-org:service:RenderingControl:1",
+          "GetVolume",
+          "<u:GetVolume xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">"
+          "<InstanceID>0</InstanceID><Channel>Master</Channel></u:GetVolume>");
+
+      if (!v_resp.empty()) {
+        std::string vol_str = self->extract_xml_value(v_resp, "CurrentVolume");
+        if (!vol_str.empty()) {
+          // Non-throwing parse: std::stof would abort the task on malformed
+          // input, and this task deliberately avoids exceptions.
+          char *end = nullptr;
+          float vol = strtof(vol_str.c_str(), &end);
+          if (end != vol_str.c_str()) {
+            result->volume = vol / 100.0f;
+          }
+        }
+      }
+    }
+
+    // Hand result to the main loop – all sensor writes happen there.
+    self->defer([self, result]() {
+      self->apply_poll_result_(*result);
+      delete result;
+    });
+  }
+
+  // Should never reach here; clean up if it ever does.
+  if (client != nullptr) esp_http_client_cleanup(client);
+  vTaskDelete(nullptr);
+}
+
+void SonosPlayer::apply_poll_result_(const PollResult &r) {
+  if (!r.connected) {
     consecutive_failures_++;
     if (consecutive_failures_ <= kMaxLoggedFailures) {
-      ESP_LOGW(TAG, "GetTransportInfo failed (attempt %d)", consecutive_failures_);
+      ESP_LOGW(TAG, "SOAP poll failed (attempt %d)", consecutive_failures_);
     }
     return;
   }
+
   consecutive_failures_ = 0;
 
-  std::string raw_state = extract_xml_value(transport_resp, "CurrentTransportState");
-  std::string ha_state;
-  if (raw_state == "PLAYING") {
-    ha_state = "playing";
-  } else if (raw_state == "PAUSED_PLAYBACK") {
-    ha_state = "paused";
-  } else if (raw_state == "STOPPED") {
-    ha_state = "idle";
-  } else {
-    ha_state = "idle";
+  // Sync local tracking vars from the authoritative SOAP response so the
+  // per-second local increment in update() starts from the correct baseline.
+  local_state_ = r.state;
+  if (r.duration >= 0.0f) local_duration_ = r.duration;
+  if (r.position >= 0.0f) local_position_ = r.position;
+
+  // Only publish sensors when the value has changed to avoid flooding the
+  // native API / HA with duplicate packets at 1-second poll intervals.
+  if (state_sensor_ && r.state != last_published_state_) {
+    last_published_state_ = r.state;
+    state_sensor_->publish_state(r.state);
   }
-
-  if (state_sensor_ != nullptr) {
-    state_sensor_->publish_state(ha_state);
+  if (duration_sensor_ && r.duration >= 0.0f && r.duration != last_published_duration_) {
+    last_published_duration_ = r.duration;
+    duration_sensor_->publish_state(r.duration);
   }
-
-  // ---- Position / track info ----
-  std::string pos_resp = soap_call(
-      "/MediaRenderer/AVTransport/Control",
-      "urn:schemas-upnp-org:service:AVTransport:1",
-      "GetPositionInfo",
-      "<u:GetPositionInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">"
-      "<InstanceID>0</InstanceID>"
-      "</u:GetPositionInfo>");
-
-  if (pos_resp.empty()) return;
-
-  // Duration
-  std::string duration_str = extract_xml_value(pos_resp, "TrackDuration");
-  float duration = parse_duration(duration_str);
-  if (duration >= 0.0f && duration_sensor_ != nullptr) {
-    duration_sensor_->publish_state(duration);
+  // position_sensor_ is published solely by update() to prevent double-publish
+  // and the 0-flash that occurs when apply and update both fire in one tick.
+  //
+  // Only touch title/artist/artwork when this poll actually fetched metadata
+  // (GetPositionInfo succeeded).  Otherwise a transient GetPositionInfo failure
+  // would publish empty strings and momentarily blank the UI even though the
+  // track has not changed.
+  if (r.have_metadata) {
+  if (title_sensor_ && r.title != last_published_title_) {
+    last_published_title_ = r.title;
+    title_sensor_->publish_state(r.title);
   }
-
-  // Elapsed position
-  std::string reltime_str = extract_xml_value(pos_resp, "RelTime");
-  float position = parse_duration(reltime_str);
-  if (position >= 0.0f && position_sensor_ != nullptr) {
-    position_sensor_->publish_state(position);
+  if (artist_sensor_ && r.artist != last_published_artist_) {
+    last_published_artist_ = r.artist;
+    artist_sensor_->publish_state(r.artist);
   }
-
-  // Track metadata (DIDL-Lite encoded in the response)
-  std::string metadata_encoded = extract_xml_value(pos_resp, "TrackMetaData");
-  if (!metadata_encoded.empty() && metadata_encoded != "NOT_IMPLEMENTED") {
-    std::string metadata = decode_xml_entities(metadata_encoded);
-
-    std::string title = extract_xml_value(metadata, "title");    // dc:title
-    std::string artist = extract_xml_value(metadata, "creator"); // dc:creator
-    std::string art_path = extract_xml_value(metadata, "albumArtURI"); // upnp:albumArtURI
-
-    // Decode &amp; in albumArtURI (Sonos double-encodes the query string)
-    if (!art_path.empty()) {
-      art_path = decode_xml_entities(art_path);
-    }
-
-    if (title_sensor_ != nullptr) {
-      title_sensor_->publish_state(title);
-    }
-    if (artist_sensor_ != nullptr) {
-      artist_sensor_->publish_state(artist);
-    }
-    if (artwork_sensor_ != nullptr && !art_path.empty()) {
-      artwork_sensor_->publish_state(resolve_artwork_url(art_path));
-    } else if (artwork_sensor_ != nullptr && art_path.empty()) {
-      artwork_sensor_->publish_state("");
-    }
+  if (artwork_sensor_ && r.artwork_url != last_published_artwork_) {
+    last_published_artwork_ = r.artwork_url;
+    // Defer artwork URL publish to a separate main-loop callback so that
+    // apply_poll_result_() returns quickly.  The artwork_image component's
+    // get_local_idf_() call blocks the loop for ~300-500 ms while it opens
+    // the HTTP connection to the Sonos /getaa endpoint; keeping it out of
+    // apply_poll_result_() prevents the "sonos_player took a long time" warning
+    // and lets title/artist appear on screen before the artwork connect starts.
+    const std::string url = r.artwork_url;
+    this->defer([this, url]() { artwork_sensor_->publish_state(url); });
   }
-}
-
-void SonosPlayer::poll_volume() {
-  std::string resp = soap_call(
-      "/MediaRenderer/RenderingControl/Control",
-      "urn:schemas-upnp-org:service:RenderingControl:1",
-      "GetVolume",
-      "<u:GetVolume xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">"
-      "<InstanceID>0</InstanceID>"
-      "<Channel>Master</Channel>"
-      "</u:GetVolume>");
-
-  if (resp.empty()) return;
-
-  std::string vol_str = extract_xml_value(resp, "CurrentVolume");
-  if (!vol_str.empty()) {
-    float vol = std::stof(vol_str) / 100.0f;
-    if (volume_sensor_ != nullptr) {
-      volume_sensor_->publish_state(vol);
-    }
+  }  // r.have_metadata
+  if (volume_sensor_ && r.volume >= 0.0f && r.volume != last_published_volume_) {
+    last_published_volume_ = r.volume;
+    volume_sensor_->publish_state(r.volume);
   }
 }
 
@@ -279,6 +490,7 @@ std::string SonosPlayer::soap_call(const std::string &path,
       "</s:Body>"
       "</s:Envelope>";
 
+  // Per-call response accumulator.
   HttpResponse resp;
 
   esp_http_client_config_t cfg{};
@@ -287,10 +499,9 @@ std::string SonosPlayer::soap_call(const std::string &path,
   cfg.timeout_ms = timeout_ms;
   cfg.event_handler = http_event_cb;
   cfg.user_data = &resp;
-  cfg.buffer_size = 4096;
-  cfg.buffer_size_tx = 1024;
-
-  esp_http_client_handle_t client = esp_http_client_init(&cfg);
+  cfg.buffer_size = 512;
+  cfg.buffer_size_tx = 512;
+  auto *client = esp_http_client_init(&cfg);
   if (client == nullptr) {
     ESP_LOGE(TAG, "Failed to init HTTP client for %s", url.c_str());
     return "";
@@ -303,9 +514,7 @@ std::string SonosPlayer::soap_call(const std::string &path,
   esp_err_t err = esp_http_client_perform(client);
   esp_http_client_cleanup(client);
 
-  if (err != ESP_OK) {
-    return "";
-  }
+  if (err != ESP_OK) return "";
   return resp.body;
 }
 
@@ -411,12 +620,26 @@ std::string SonosPlayer::resolve_artwork_url(const std::string &path) const {
     return path;
   }
   // Relative path — prefix with Sonos speaker base URL.
-  return "http://" + ip_ + ":1400" + path;
+  return "http://" + get_ip_() + ":1400" + path;
 }
 
 // =============================================================================
 // Phase 3: SSDP Discovery and Zone Group Topology
 // =============================================================================
+
+void SonosPlayer::request_discovery() {
+  if (discovery_active_.load()) {
+    ESP_LOGW(TAG, "Discovery already running");
+    return;
+  }
+  // Set active first so is_discovery_active() is true the instant we return.
+  discovery_active_ = true;
+  discovery_requested_ = true;
+  if (soap_task_handle_ != nullptr) {
+    xTaskNotifyGive(static_cast<TaskHandle_t>(soap_task_handle_));
+  }
+  ESP_LOGI(TAG, "Async discovery requested");
+}
 
 void SonosPlayer::start_discovery() {
   if (discovery_in_progress_) {
